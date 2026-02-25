@@ -4,6 +4,7 @@ from pathlib import Path
 
 import jdatetime
 from bidi.algorithm import get_display
+from openpyxl import Workbook, load_workbook
 
 from config import DUMP_DIR, OUTPUT_DIR, SQLITE_DB_PATH, TABLE_GROUPS
 from core.customer_purchases import (
@@ -170,17 +171,7 @@ def run_import_new_data() -> None:
 
     folder_name = prefix.rstrip("_") if prefix else "output"
     output_folder = create_output_folder(OUTPUT_DIR, folder_name)
-    write_output_readme(
-        output_folder,
-        info["name"],
-        info["size_mb"],
-        complete_groups=complete_groups,
-        table_groups=TABLE_GROUPS,
-        table_row_counts=table_row_counts,
-        rfm_from_shamsi_date=rfm_from_shamsi_date,
-    )
-    print(rtl(f"\nپوشه خروجی: {output_folder}"))
-    print(rtl("فایل README.txt ایجاد شد."))
+    generated_files: list[str] = []
 
     if CUSTOMER_PURCHASES_VIEW in table_row_counts:
         headers = [
@@ -202,6 +193,7 @@ def run_import_new_data() -> None:
             )
             for p in paths:
                 print(rtl(f"فایل Excel: {p.name}"))
+                generated_files.append(p.name)
 
     if USER_FULL_DATA_TABLE in table_row_counts:
         with SQLiteManager(SQLITE_DB_PATH) as db:
@@ -212,6 +204,7 @@ def run_import_new_data() -> None:
             )
             for p in paths:
                 print(rtl(f"فایل Excel: {p.name}"))
+                generated_files.append(p.name)
 
     if RFM_DATA_TABLE in table_row_counts:
         with SQLiteManager(SQLITE_DB_PATH) as db:
@@ -226,15 +219,314 @@ def run_import_new_data() -> None:
             )
             for p in paths:
                 print(rtl(f"فایل Excel: {p.name}"))
+                generated_files.append(p.name)
 
             # ساخت فایل ثابت‌ها/لیبل‌های پیشنهادی RFM برای استفاده کاربر و مراحل بعد
             const_path = create_rfm_constant_excel(db, output_folder)
             print(rtl(f"فایل Excel: {const_path.name}"))
+            generated_files.append(const_path.name)
 
     # کپی دیتابیس موقت به پوشه خروجی
     dest_db = output_folder / "converted.db"
     shutil.copy2(SQLITE_DB_PATH, dest_db)
     print(rtl(f"کپی دیتابیس به پوشه خروجی: {dest_db.name}"))
+
+    write_output_readme(
+        output_folder,
+        info["name"],
+        info["size_mb"],
+        complete_groups=complete_groups,
+        table_groups=TABLE_GROUPS,
+        table_row_counts=table_row_counts,
+        rfm_from_shamsi_date=rfm_from_shamsi_date,
+        excel_files=generated_files,
+    )
+    print(rtl(f"\nپوشه خروجی: {output_folder}"))
+    print(rtl("فایل README.txt ایجاد شد."))
+
+
+# ستون‌های لازم در فایل ۱_rfm_data.xlsx
+RFM_DATA_REQUIRED_COLUMNS = {
+    "user_id",
+    "last_order_date",
+    "last_order_date_shamsi",
+    "total_orders",
+    "total_spent",
+    "last_order_amount",
+    "recency_days",
+}
+
+# شیت‌ها و ستون‌های لازم در rfm_constant.xlsx
+RFM_CONSTANT_REQUIRED_SHEETS = {"meta", "thresholds"}
+RFM_CONSTANT_THRESHOLDS_COLUMNS = {"metric", "score", "min_value", "max_value"}
+RFM_SCORE_REQUIRED_METRICS = {"recency_days", "total_orders", "total_spent"}
+
+
+def _to_float(value):
+    if value is None:
+        return None
+    txt = str(value).strip()
+    if not txt:
+        return None
+    try:
+        return float(txt.replace(",", ""))
+    except Exception:
+        return None
+
+
+def _excel_sort_key(path: Path):
+    """
+    مرتب‌سازی فایل‌های chunked مثل:
+    1_rfm_data.xlsx, 2_rfm_data.xlsx, ...
+    """
+    name = path.name
+    parts = name.split("_", 1)
+    if len(parts) == 2 and parts[0].isdigit():
+        return int(parts[0]), name
+    return 10**9, name
+
+
+def _load_rfm_thresholds(constant_file: Path) -> tuple[dict[str, list[tuple[float, float, int]]], str | None]:
+    """
+    thresholds را از rfm_constant.xlsx می‌خواند.
+    خروجی:
+      ({metric: [(min, max, score), ...]}, error_message)
+    """
+    try:
+        wb = load_workbook(constant_file, read_only=True, data_only=True)
+        if "thresholds" not in wb.sheetnames:
+            wb.close()
+            return {}, rtl("شیت thresholds در rfm_constant.xlsx یافت نشد.")
+        ws = wb["thresholds"]
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not header_row:
+            wb.close()
+            return {}, rtl("هدر شیت thresholds خالی است.")
+        headers = [str(c).strip() if c is not None else "" for c in header_row]
+        idx = {h: i for i, h in enumerate(headers)}
+        required = ["metric", "min_value", "max_value", "score"]
+        if not all(k in idx for k in required):
+            wb.close()
+            return {}, rtl("ستون‌های لازم برای thresholds کامل نیستند.")
+
+        rules: dict[str, list[tuple[float, float, int]]] = {}
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            metric = row[idx["metric"]] if idx["metric"] < len(row) else None
+            if metric is None:
+                continue
+            metric = str(metric).strip()
+            min_v = _to_float(row[idx["min_value"]] if idx["min_value"] < len(row) else None)
+            max_v = _to_float(row[idx["max_value"]] if idx["max_value"] < len(row) else None)
+            score_v = row[idx["score"]] if idx["score"] < len(row) else None
+            if min_v is None or max_v is None or score_v is None:
+                continue
+            try:
+                score_i = int(float(str(score_v)))
+            except Exception:
+                continue
+            rules.setdefault(metric, []).append((min_v, max_v, score_i))
+        wb.close()
+
+        for metric in RFM_SCORE_REQUIRED_METRICS:
+            if metric not in rules or not rules[metric]:
+                return {}, rtl(f"برای معیار {metric} در thresholds قانونی پیدا نشد.")
+            rules[metric].sort(key=lambda x: (x[0], x[1]))
+
+        return rules, None
+    except Exception as e:
+        return {}, rtl(f"خطا در خواندن rfm_constant.xlsx: {e!s}")
+
+
+def _score_by_rules(value, rules: list[tuple[float, float, int]]) -> int:
+    """
+    امتیازدهی مقدار بر اساس بازه‌های (min,max,score).
+    """
+    v = _to_float(value)
+    if v is None:
+        return 0
+
+    # تطبیق مستقیم بازه
+    for min_v, max_v, score in rules:
+        if min_v <= v <= max_v:
+            return score
+
+    # fallback برای خطاهای گردکردن/مرزها
+    if v < rules[0][0]:
+        return rules[0][2]
+    if v > rules[-1][1]:
+        return rules[-1][2]
+
+    # نزدیک‌ترین بازه
+    best_score = rules[0][2]
+    best_dist = float("inf")
+    for min_v, max_v, score in rules:
+        center = (min_v + max_v) / 2
+        d = abs(v - center)
+        if d < best_dist:
+            best_dist = d
+            best_score = score
+    return best_score
+
+
+def _build_rfm_scores_file(folder: Path) -> tuple[bool, str]:
+    """
+    از روی فایل‌های rfm_data و rfm_constant امتیاز R/F/M را محاسبه می‌کند
+    و فایل rfm_scores.xlsx را می‌سازد.
+    """
+    folder = Path(folder)
+    constant_file = folder / "rfm_constant.xlsx"
+    if not constant_file.is_file():
+        return False, rtl("فایل rfm_constant.xlsx موجود نیست.")
+
+    rfm_data_files = sorted(folder.glob("*_rfm_data.xlsx"), key=_excel_sort_key)
+    if not rfm_data_files:
+        single = folder / "rfm_data.xlsx"
+        if single.is_file():
+            rfm_data_files = [single]
+    if not rfm_data_files:
+        return False, rtl("فایل‌های rfm_data پیدا نشدند.")
+
+    rules, err = _load_rfm_thresholds(constant_file)
+    if err:
+        return False, err
+
+    output_file = folder / "rfm_scores.xlsx"
+    wb_out = Workbook(write_only=True)
+    ws_out = wb_out.create_sheet("rfm_scores")
+    ws_out.append(
+        [
+            "user_id",
+            "r_score",
+            "f_score",
+            "m_score",
+            "rfm_score",
+            "recency_days",
+            "total_orders",
+            "total_spent",
+            "last_order_amount",
+            "last_order_date",
+            "last_order_date_shamsi",
+        ]
+    )
+
+    required_headers = {
+        "user_id",
+        "last_order_date",
+        "last_order_date_shamsi",
+        "total_orders",
+        "total_spent",
+        "last_order_amount",
+        "recency_days",
+    }
+
+    try:
+        for file_path in rfm_data_files:
+            wb_in = load_workbook(file_path, read_only=True, data_only=True)
+            if not wb_in.sheetnames:
+                wb_in.close()
+                continue
+            ws = wb_in[wb_in.sheetnames[0]]
+            header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+            if not header_row:
+                wb_in.close()
+                continue
+            headers = [str(c).strip() if c is not None else "" for c in header_row]
+            idx = {h: i for i, h in enumerate(headers)}
+            missing = required_headers - set(idx.keys())
+            if missing:
+                wb_in.close()
+                return False, rtl(f"ستون‌های لازم در {file_path.name} ناقص هستند: {missing}")
+
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                user_id = row[idx["user_id"]] if idx["user_id"] < len(row) else None
+                recency_days = row[idx["recency_days"]] if idx["recency_days"] < len(row) else None
+                total_orders = row[idx["total_orders"]] if idx["total_orders"] < len(row) else None
+                total_spent = row[idx["total_spent"]] if idx["total_spent"] < len(row) else None
+                last_order_amount = row[idx["last_order_amount"]] if idx["last_order_amount"] < len(row) else None
+                last_order_date = row[idx["last_order_date"]] if idx["last_order_date"] < len(row) else None
+                last_order_date_shamsi = (
+                    row[idx["last_order_date_shamsi"]] if idx["last_order_date_shamsi"] < len(row) else None
+                )
+
+                r_score = _score_by_rules(recency_days, rules["recency_days"])
+                f_score = _score_by_rules(total_orders, rules["total_orders"])
+                m_score = _score_by_rules(total_spent, rules["total_spent"])
+                rfm_score = f"{r_score}{f_score}{m_score}"
+
+                ws_out.append(
+                    [
+                        user_id,
+                        r_score,
+                        f_score,
+                        m_score,
+                        rfm_score,
+                        recency_days,
+                        total_orders,
+                        total_spent,
+                        last_order_amount,
+                        last_order_date,
+                        last_order_date_shamsi,
+                    ]
+                )
+            wb_in.close()
+
+        wb_out.save(output_file)
+        return True, rtl(f"فایل rfm_scores.xlsx با موفقیت ایجاد شد.")
+    except Exception as e:
+        return False, rtl(f"خطا در ساخت rfm_scores.xlsx: {e!s}")
+
+
+def _validate_rfm_output_folder(folder: Path) -> tuple[bool, str]:
+    """
+    چک می‌کند که 1_rfm_data.xlsx و rfm_constant.xlsx در پوشه باشند و ستون‌های لازم را داشته باشند.
+    برمی‌گرداند: (ok: bool, message: str)
+    """
+    folder = Path(folder)
+    rfm_data_file = folder / "1_rfm_data.xlsx"
+    rfm_constant_file = folder / "rfm_constant.xlsx"
+
+    if not rfm_data_file.is_file():
+        return False, rtl("فایل 1_rfm_data.xlsx یافت نشد.")
+    if not rfm_constant_file.is_file():
+        return False, rtl("فایل rfm_constant.xlsx یافت نشد.")
+
+    try:
+        wb_data = load_workbook(rfm_data_file, read_only=True, data_only=True)
+        if not wb_data.sheetnames:
+            wb_data.close()
+            return False, rtl("فایل 1_rfm_data.xlsx شیت ندارد.")
+        ws = wb_data[wb_data.sheetnames[0]]
+        row1 = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        wb_data.close()
+        if not row1:
+            return False, rtl("فایل 1_rfm_data.xlsx هدر ندارد.")
+        headers = {str(c).strip() for c in row1 if c is not None}
+        missing = RFM_DATA_REQUIRED_COLUMNS - headers
+        if missing:
+            return False, rtl(f"فایل 1_rfm_data.xlsx ستون‌های لازم را ندارد: {missing}")
+    except Exception as e:
+        return False, rtl(f"خطا در خواندن 1_rfm_data.xlsx: {e!s}")
+
+    try:
+        wb_const = load_workbook(rfm_constant_file, read_only=True, data_only=True)
+        sheet_names = set(wb_const.sheetnames)
+        missing_sheets = RFM_CONSTANT_REQUIRED_SHEETS - sheet_names
+        if missing_sheets:
+            wb_const.close()
+            return False, rtl(f"فایل rfm_constant.xlsx شیت‌های لازم را ندارد: {missing_sheets}")
+        ws_thr = wb_const["thresholds"]
+        row1 = next(ws_thr.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        wb_const.close()
+        if not row1:
+            return False, rtl("شیت thresholds در rfm_constant.xlsx هدر ندارد.")
+        headers = {str(c).strip() for c in row1 if c is not None}
+        missing = RFM_CONSTANT_THRESHOLDS_COLUMNS - headers
+        if missing:
+            return False, rtl(f"شیت thresholds ستون‌های لازم را ندارد: {missing}")
+    except Exception as e:
+        return False, rtl(f"خطا در خواندن rfm_constant.xlsx: {e!s}")
+
+    return True, rtl("فایلها به درستی موجود هستند.")
 
 
 def run_use_existing_data() -> Path | None:
@@ -272,6 +564,16 @@ def run_use_existing_data() -> Path | None:
             if 1 <= idx <= len(subdirs):
                 chosen = subdirs[idx - 1]
                 print(rtl(f"انتخاب شد: {chosen.name}"))
+                ok, msg = _validate_rfm_output_folder(chosen)
+                if ok:
+                    print(msg)
+                    score_ok, score_msg = _build_rfm_scores_file(chosen)
+                    print(score_msg)
+                    if not score_ok:
+                        print(rtl("خطا در محاسبه امتیازها؛ فایل rfm_scores ساخته نشد."))
+                else:
+                    print(rtl("فایل ها درست نیستند؛ دوباره داده‌ها را وارد کنید."))
+                    print(msg)
                 return chosen
             print(rtl("شماره نامعتبر است."))
         except ValueError:

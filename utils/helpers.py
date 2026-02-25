@@ -168,6 +168,7 @@ def write_output_readme(
     table_groups: dict[str, list[str]] = None,
     table_row_counts: dict[str, int] = None,
     rfm_from_shamsi_date: str = "0",
+    excel_files: list[str] = None,
 ) -> Path:
     """فایل README داخل پوشه خروجی با تاریخ، نام فایل، حجم، وضعیت لیست‌ها و آمار دیتابیس موقت."""
     readme_path = folder / "README.txt"
@@ -196,6 +197,12 @@ def write_output_readme(
         lines.append(f"  تعداد جدول‌ها: {len(table_row_counts)}")
         lines.append("")
         lines.extend("  " + row for row in _format_table_stats(table_row_counts, table_groups, complete_groups))
+
+    if excel_files:
+        lines.append("")
+        lines.append("فایل‌های اکسل تولید شده:")
+        for f in excel_files:
+            lines.append(f"  {f}")
 
     content = "\n".join(lines) + "\n"
     readme_path.write_text(content, encoding="utf-8")
